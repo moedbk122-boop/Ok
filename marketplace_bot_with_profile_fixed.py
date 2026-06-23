@@ -19,7 +19,7 @@ from telegram.ext import (
 # ------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------
-TOKEN = "8553144027:AAGj_XfeueLJsfc0MzgEtFRzDVjaZn1_SXQ"
+TOKEN = "8989225920:AAFHHwBb5JSJ8cVmw2e8yCov0tIb6D_sC94"
 
 ADMIN_IDS = [7935141097]
 MAIN_CHAT_ID = -1003965557035
