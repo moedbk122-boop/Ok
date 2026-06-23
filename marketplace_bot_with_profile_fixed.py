@@ -21,7 +21,7 @@ from telegram.ext import (
 # ------------------------------------------------------------
 TOKEN = "8989225920:AAFHHwBb5JSJ8cVmw2e8yCov0tIb6D_sC94"
 
-ADMIN_IDS = [7935141097]
+ADMIN_IDS = [7935141097, 8545275828]
 MAIN_CHAT_ID = -1003965557035
 
 DENY_COOLDOWN_SECONDS = 120
