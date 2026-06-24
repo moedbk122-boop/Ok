@@ -1425,27 +1425,54 @@ async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def post_start_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    data_parts = query.data.split(":")
-    if len(data_parts) != 2:
+    if not query:
         return
 
-    action, uid_str = data_parts
-    uid = int(uid_str)
+    raw_data = str(query.data or "").strip()
+    action = raw_data
+    uid = query.from_user.id
+
+    if ":" in raw_data:
+        action, uid_str = raw_data.split(":", 1)
+        try:
+            uid = int(uid_str)
+        except ValueError:
+            await query.answer("Invalid button. Please use /post again.", show_alert=True)
+            return
+
+    action = action.lower()
+    start_actions = {"startpost", "start_post", "post_yes", "postyes", "yespost", "yes"}
+    cancel_actions = {"cancelpost", "cancel_post", "post_no", "postno", "nopost", "no", "cancel"}
+
+    if action not in start_actions and action not in cancel_actions:
+        await query.answer("Invalid button. Please use /post again.", show_alert=True)
+        return
+
     if query.from_user.id != uid:
-        await query.edit_message_text("This confirmation does not belong to you.")
+        await query.answer("This confirmation does not belong to you.", show_alert=True)
         return
 
     username = query.from_user.username or "no_username"
-    if action == "cancelpost":
+
+    async def reply_or_edit(text: str):
+        try:
+            await query.edit_message_text(text, reply_markup=None)
+        except Exception:
+            logger.exception("Could not edit /post start confirmation message")
+            if query.message:
+                await query.message.reply_text(text)
+
+    if action in cancel_actions:
+        await query.answer("Cancelled.")
         clear_post_flow(context)
         log_user_activity(uid, username, "POST CANCELLED", "User cancelled before description")
-        await query.edit_message_text("Post creation cancelled.")
+        await reply_or_edit("Post creation cancelled.")
         return
 
+    await query.answer("Starting post...")
     context.user_data[USER_AWAITING_DESCRIPTION] = True
     log_user_activity(uid, username, "POST DESCRIPTION STARTED")
-    await query.edit_message_text("Send the description of your listing.")
+    await reply_or_edit("Send the description of your listing.")
 
 
 async def receive_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2201,7 +2228,10 @@ def main():
 
     # Normal post callbacks
     app.add_handler(
-        CallbackQueryHandler(post_start_confirm, pattern=r"^(startpost|cancelpost):")
+        CallbackQueryHandler(
+            post_start_confirm,
+            pattern=r"(?i)^(start_?post|cancel_?post|post_?yes|post_?no|yes_?post|no_?post|yes|no|cancel)(?::\d+)?$",
+        )
     )
     app.add_handler(
         CallbackQueryHandler(image_choice, pattern=r"^(addimage|skipimage):")
@@ -2253,7 +2283,7 @@ def main():
     )
 
     logger.info("Bot starting with server monitoring and schedule features enabled...")
-    app.run_polling()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
