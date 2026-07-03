@@ -1009,8 +1009,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     message = (
         "Marketplace Bot\n\n"
-        "Send an image with its caption/description together in this bot DM "
-        "to publish it to the main channel.\n"
+        "To post, send one message here:\n"
+        "- Text only\n"
+        "- Image only\n"
+        "- Image with caption\n\n"
+        "The bot will publish it to the main channel.\n"
         "/schedule - Schedule up to 3 posts\n"
         "/myschedule - View your scheduled posts\n"
         "/deleteschedule <post_id> - Delete a scheduled post\n"
@@ -1400,12 +1403,14 @@ async def validate_direct_publish_request(update: Update, context: ContextTypes.
     if update.effective_chat and update.effective_chat.type != "private":
         return False
 
-    # Direct publishing is allowed only when the user sends one Telegram
-    # message containing both an image and caption/description together.
-    if not update.message.photo or not (update.message.caption and update.message.caption.strip()):
+    # Direct publishing is allowed for one Telegram DM message containing
+    # text only, image only, or an image with a caption.
+    has_text = bool(update.message.text and update.message.text.strip())
+    has_photo = bool(update.message.photo)
+    has_caption = bool(update.message.caption and update.message.caption.strip())
+    if not (has_text or has_photo or has_caption):
         await update.message.reply_text(
-            "Please send the image and description together in one message. "
-            "Plain text alone will not be posted."
+            "Send a text message, an image, or an image with a caption to publish."
         )
         return False
 
@@ -1463,8 +1468,8 @@ async def publish_direct_message(update: Update, context: ContextTypes.DEFAULT_T
     username = update.effective_user.username or "no_username"
     message = update.message
 
-    # copy_message keeps Telegram formatting/entities intact and keeps the photo
-    # together with its caption/description in one channel post.
+    # copy_message keeps Telegram formatting/entities intact for text, image,
+    # or image with caption.
     try:
         await context.bot.copy_message(
             chat_id=MAIN_CHAT_ID,
@@ -1477,8 +1482,8 @@ async def publish_direct_message(update: Update, context: ContextTypes.DEFAULT_T
         await message.reply_text("Failed to publish your post. Please try again later.")
         return
 
-    description = message.caption or ""
-    has_image = True
+    description = message.caption or message.text or ""
+    has_image = bool(message.photo)
 
     increment_post_count(uid)
     log_post_published(uid, username, description, has_image)
@@ -1939,22 +1944,19 @@ async def deleteschedule_command(update: Update, context: ContextTypes.DEFAULT_T
 # Message Routers
 # ------------------------------------------------------------
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Schedule prompts still take priority. Outside scheduling, plain text alone
-    # is not posted; users must send an image and caption together.
+    # Schedule prompts still take priority. Outside scheduling, text messages
+    # are copied directly to the main channel.
     if context.user_data.get(USER_AWAITING_SCHEDULE_TIME):
         await receive_schedule_time(update, context)
     elif context.user_data.get(USER_SCHEDULE_AWAITING_DESCRIPTION):
         await receive_schedule_description(update, context)
     else:
-        await update.message.reply_text(
-            "Please send the image and description together in one message. "
-            "Plain text alone will not be posted."
-        )
+        await publish_direct_message(update, context)
 
 
 async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Schedule image prompts still take priority. Outside scheduling, only a
-    # photo with caption/description is copied to the main channel as one post.
+    # Schedule image prompts still take priority. Outside scheduling, photo
+    # messages are copied directly to the main channel, with caption if present.
     if context.user_data.get(USER_SCHEDULE_AWAITING_IMAGE):
         await receive_schedule_image(update, context)
     else:
