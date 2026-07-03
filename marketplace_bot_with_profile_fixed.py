@@ -1467,23 +1467,39 @@ async def publish_direct_message(update: Update, context: ContextTypes.DEFAULT_T
     uid = update.effective_user.id
     username = update.effective_user.username or "no_username"
     message = update.message
+    footer = (
+        f"Posted by @{update.effective_user.username}"
+        if update.effective_user.username
+        else f"Posted by User {uid}"
+    )
 
-    # copy_message keeps Telegram formatting/entities intact for text, image,
-    # or image with caption.
     try:
-        await context.bot.copy_message(
-            chat_id=MAIN_CHAT_ID,
-            from_chat_id=message.chat_id,
-            message_id=message.message_id,
-        )
+        if message.photo:
+            original_caption = message.caption or ""
+            caption = f"{original_caption}\n\n{footer}" if original_caption else footer
+            await context.bot.send_photo(
+                chat_id=MAIN_CHAT_ID,
+                photo=message.photo[-1].file_id,
+                caption=caption,
+                caption_entities=message.caption_entities,
+            )
+            description = original_caption
+            has_image = True
+        else:
+            original_text = message.text or ""
+            text = f"{original_text}\n\n{footer}"
+            await context.bot.send_message(
+                chat_id=MAIN_CHAT_ID,
+                text=text,
+                entities=message.entities,
+            )
+            description = original_text
+            has_image = False
     except Exception as exc:
-        logger.exception("Failed to copy direct message to main chat")
+        logger.exception("Failed to send direct message to main chat")
         log_user_activity(uid, username, "DIRECT POST FAILED", str(exc))
         await message.reply_text("Failed to publish your post. Please try again later.")
         return
-
-    description = message.caption or message.text or ""
-    has_image = bool(message.photo)
 
     increment_post_count(uid)
     log_post_published(uid, username, description, has_image)
