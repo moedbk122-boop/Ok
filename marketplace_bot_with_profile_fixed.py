@@ -1009,9 +1009,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     message = (
         "Marketplace Bot\n\n"
-        "Send a text message, or send an image with its caption, directly in this bot DM "
+        "Send an image with its caption/description together in this bot DM "
         "to publish it to the main channel.\n"
-        "/post - Show direct posting instructions\n"
         "/schedule - Schedule up to 3 posts\n"
         "/myschedule - View your scheduled posts\n"
         "/deleteschedule <post_id> - Delete a scheduled post\n"
@@ -1390,48 +1389,6 @@ def is_schedule_flow_active(context: ContextTypes.DEFAULT_TYPE) -> bool:
     )
 
 
-async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-
-    if is_blacklisted(uid):
-        await update.message.reply_text("You are blacklisted from using this bot.")
-        return
-
-    lic = get_license(uid)
-    if not lic or utcnow() > datetime.fromisoformat(lic["expires_at"]):
-        await update.message.reply_text("You do not have an active license.")
-        return
-
-    reset_daily_counts_if_needed(uid)
-    lic = get_license(uid)
-    remaining_posts = max(0, lic["posts_per_day"] - lic["posts_today"])
-
-    if remaining_posts <= 0:
-        await update.message.reply_text("Daily post limit reached.")
-        return
-
-    cooldown_note = ""
-    if not is_admin(uid):
-        cooldown = get_cooldown(uid)
-        if cooldown and utcnow() < cooldown:
-            remaining_seconds = max(0, int((cooldown - utcnow()).total_seconds()))
-            minutes, seconds = divmod(remaining_seconds, 60)
-            await update.message.reply_text(
-                f"You are on cooldown for {minutes} minutes and {seconds} more seconds."
-            )
-            return
-        cooldown_note = "\nAfter each post, you will have a 10-minute cooldown."
-
-    clear_post_flow(context)
-    await update.message.reply_text(
-        "The /post button flow has been removed.\n\n"
-        "To publish, paste or send one Telegram message directly in this bot DM. "
-        "You can send text only, or an image with its caption/description in the same message. "
-        "The bot will copy it to the main channel with the Telegram formatting preserved.\n\n"
-        f"Posts remaining today: {remaining_posts}"
-        f"{cooldown_note}"
-    )
-
 
 async def validate_direct_publish_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     uid = update.effective_user.id
@@ -1441,6 +1398,15 @@ async def validate_direct_publish_request(update: Update, context: ContextTypes.
         return False
 
     if update.effective_chat and update.effective_chat.type != "private":
+        return False
+
+    # Direct publishing is allowed only when the user sends one Telegram
+    # message containing both an image and caption/description together.
+    if not update.message.photo or not (update.message.caption and update.message.caption.strip()):
+        await update.message.reply_text(
+            "Please send the image and description together in one message. "
+            "Plain text alone will not be posted."
+        )
         return False
 
     if is_schedule_flow_active(context):
@@ -1497,7 +1463,7 @@ async def publish_direct_message(update: Update, context: ContextTypes.DEFAULT_T
     username = update.effective_user.username or "no_username"
     message = update.message
 
-    # copy_message keeps Telegram formatting/entities intact and keeps a photo
+    # copy_message keeps Telegram formatting/entities intact and keeps the photo
     # together with its caption/description in one channel post.
     try:
         await context.bot.copy_message(
@@ -1511,8 +1477,8 @@ async def publish_direct_message(update: Update, context: ContextTypes.DEFAULT_T
         await message.reply_text("Failed to publish your post. Please try again later.")
         return
 
-    description = message.caption or message.text or ""
-    has_image = bool(message.photo)
+    description = message.caption or ""
+    has_image = True
 
     increment_post_count(uid)
     log_post_published(uid, username, description, has_image)
@@ -1973,19 +1939,22 @@ async def deleteschedule_command(update: Update, context: ContextTypes.DEFAULT_T
 # Message Routers
 # ------------------------------------------------------------
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Schedule prompts still take priority. Otherwise, any private DM text
-    # is treated as a direct post and copied to the main channel.
+    # Schedule prompts still take priority. Outside scheduling, plain text alone
+    # is not posted; users must send an image and caption together.
     if context.user_data.get(USER_AWAITING_SCHEDULE_TIME):
         await receive_schedule_time(update, context)
     elif context.user_data.get(USER_SCHEDULE_AWAITING_DESCRIPTION):
         await receive_schedule_description(update, context)
     else:
-        await publish_direct_message(update, context)
+        await update.message.reply_text(
+            "Please send the image and description together in one message. "
+            "Plain text alone will not be posted."
+        )
 
 
 async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Schedule image prompts still take priority. Otherwise, any private DM
-    # photo with optional caption is copied to the main channel as one post.
+    # Schedule image prompts still take priority. Outside scheduling, only a
+    # photo with caption/description is copied to the main channel as one post.
     if context.user_data.get(USER_SCHEDULE_AWAITING_IMAGE):
         await receive_schedule_image(update, context)
     else:
@@ -2055,7 +2024,6 @@ def main():
 
     # Basic commands
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("post", post_command))
     app.add_handler(CommandHandler("license", license_command))
     app.add_handler(CommandHandler("profile", profile_command))
     app.add_handler(CommandHandler("schedule", schedule_command))
