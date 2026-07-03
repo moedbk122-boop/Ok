@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import sqlite3
@@ -25,7 +26,7 @@ ADMIN_IDS = [7935141097, 8545275828]
 MAIN_CHAT_ID = -1003965557035
 
 DENY_COOLDOWN_SECONDS = 120
-POST_COOLDOWN_SECONDS = 1200
+POST_COOLDOWN_SECONDS = 600
 
 DB_PATH = "marketplace.db"
 USER_LOG_PATH = "users.log"
@@ -1008,7 +1009,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     message = (
         "Marketplace Bot\n\n"
-        "/post - Create and publish a post\n"
+        "Send a text message, or send an image with its caption, directly in this bot DM "
+        "to publish it to the main channel.\n"
+        "/post - Show direct posting instructions\n"
         "/schedule - Schedule up to 3 posts\n"
         "/myschedule - View your scheduled posts\n"
         "/deleteschedule <post_id> - Delete a scheduled post\n"
@@ -1027,7 +1030,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/unblacklist <user_id>\n"
             "/viewlogs [lines]\n"
             "/monitor\n"
-            "/serverlogs [entries]"
+            "/serverlogs [entries]\n"
+            "/shutdown"
         )
     await update.message.reply_text(message)
 
@@ -1369,16 +1373,44 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ------------------------------------------------------------
-# User Flow: /post
+# Direct Post Publishing
 # ------------------------------------------------------------
+def is_schedule_flow_active(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    return any(
+        context.user_data.get(key)
+        for key in (
+            USER_SCHEDULE_POST_COUNT,
+            USER_SCHEDULE_CURRENT_POST,
+            USER_SCHEDULE_POSTS,
+            USER_SCHEDULE_TIME,
+            USER_AWAITING_SCHEDULE_TIME,
+            USER_SCHEDULE_AWAITING_DESCRIPTION,
+            USER_SCHEDULE_AWAITING_IMAGE,
+        )
+    )
+
+
 async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    username = update.effective_user.username or "no_username"
 
     if is_blacklisted(uid):
         await update.message.reply_text("You are blacklisted from using this bot.")
         return
 
+    lic = get_license(uid)
+    if not lic or utcnow() > datetime.fromisoformat(lic["expires_at"]):
+        await update.message.reply_text("You do not have an active license.")
+        return
+
+    reset_daily_counts_if_needed(uid)
+    lic = get_license(uid)
+    remaining_posts = max(0, lic["posts_per_day"] - lic["posts_today"])
+
+    if remaining_posts <= 0:
+        await update.message.reply_text("Daily post limit reached.")
+        return
+
+    cooldown_note = ""
     if not is_admin(uid):
         cooldown = get_cooldown(uid)
         if cooldown and utcnow() < cooldown:
@@ -1388,322 +1420,108 @@ async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"You are on cooldown for {minutes} minutes and {seconds} more seconds."
             )
             return
+        cooldown_note = "\nAfter each post, you will have a 10-minute cooldown."
+
+    clear_post_flow(context)
+    await update.message.reply_text(
+        "The /post button flow has been removed.\n\n"
+        "To publish, paste or send one Telegram message directly in this bot DM. "
+        "You can send text only, or an image with its caption/description in the same message. "
+        "The bot will copy it to the main channel with the Telegram formatting preserved.\n\n"
+        f"Posts remaining today: {remaining_posts}"
+        f"{cooldown_note}"
+    )
+
+
+async def validate_direct_publish_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    uid = update.effective_user.id
+    username = update.effective_user.username or "no_username"
+
+    if not update.message:
+        return False
+
+    if update.effective_chat and update.effective_chat.type != "private":
+        return False
+
+    if is_schedule_flow_active(context):
+        await update.message.reply_text(
+            "You are currently in the schedule flow. Finish the schedule prompts first, "
+            "or restart the bot if you want to publish a direct post instead."
+        )
+        return False
+
+    if is_blacklisted(uid):
+        await update.message.reply_text("You are blacklisted from using this bot.")
+        return False
+
+    if not is_admin(uid):
+        cooldown = get_cooldown(uid)
+        if cooldown and utcnow() < cooldown:
+            remaining_seconds = max(0, int((cooldown - utcnow()).total_seconds()))
+            minutes, seconds = divmod(remaining_seconds, 60)
+            await update.message.reply_text(
+                f"You are on cooldown for {minutes} minutes and {seconds} more seconds."
+            )
+            return False
 
     lic = get_license(uid)
     if not lic:
         await update.message.reply_text("You do not have an active license.")
-        return
+        return False
 
     expires = datetime.fromisoformat(lic["expires_at"])
     if utcnow() > expires:
         await update.message.reply_text("Your license has expired.")
-        return
+        return False
 
     reset_daily_counts_if_needed(uid)
     lic = get_license(uid)
-    if lic["posts_today"] >= lic["posts_per_day"]:
+    if not lic or lic["posts_today"] >= lic["posts_per_day"]:
         await update.message.reply_text("Daily post limit reached.")
-        return
+        return False
 
-    clear_post_flow(context)
-    clear_schedule_flow(context)
     log_user_activity(
         uid,
         username,
-        "POST ATTEMPT",
+        "DIRECT POST ATTEMPT",
         f"Posts today: {lic['posts_today']}/{lic['posts_per_day']}",
     )
-
-    keyboard = InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("Yes", callback_data=f"startpost:{uid}"),
-            InlineKeyboardButton("No", callback_data=f"cancelpost:{uid}"),
-        ]]
-    )
-    await update.message.reply_text("Begin creating a post?", reply_markup=keyboard)
+    return True
 
 
-async def post_start_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query:
+async def publish_direct_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await validate_direct_publish_request(update, context):
         return
 
-    raw_data = str(query.data or "").strip()
-    action = raw_data
-    uid = query.from_user.id
-
-    if ":" in raw_data:
-        action, uid_str = raw_data.split(":", 1)
-        try:
-            uid = int(uid_str)
-        except ValueError:
-            await query.answer("Invalid button. Please use /post again.", show_alert=True)
-            return
-
-    action = action.lower()
-    start_actions = {"startpost", "start_post", "post_yes", "postyes", "yespost", "yes"}
-    cancel_actions = {"cancelpost", "cancel_post", "post_no", "postno", "nopost", "no", "cancel"}
-
-    if action not in start_actions and action not in cancel_actions:
-        await query.answer("Invalid button. Please use /post again.", show_alert=True)
-        return
-
-    if query.from_user.id != uid:
-        await query.answer("This confirmation does not belong to you.", show_alert=True)
-        return
-
-    username = query.from_user.username or "no_username"
-
-    async def reply_or_edit(text: str):
-        try:
-            await query.edit_message_text(text, reply_markup=None)
-        except Exception:
-            logger.exception("Could not edit /post start confirmation message")
-            if query.message:
-                await query.message.reply_text(text)
-
-    if action in cancel_actions:
-        await query.answer("Cancelled.")
-        clear_post_flow(context)
-        log_user_activity(uid, username, "POST CANCELLED", "User cancelled before description")
-        await reply_or_edit("Post creation cancelled.")
-        return
-
-    await query.answer("Starting post...")
-    context.user_data[USER_AWAITING_DESCRIPTION] = True
-    log_user_activity(uid, username, "POST DESCRIPTION STARTED")
-    await reply_or_edit("Send the description of your listing.")
-
-
-async def receive_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     username = update.effective_user.username or "no_username"
-    desc = update.message.text.strip()
-    validation_error = validate_description(desc)
-    if validation_error:
-        await update.message.reply_text(validation_error)
-        return
+    message = update.message
 
-    log_user_activity(uid, username, "DESCRIPTION RECEIVED", f"Length: {len(desc)} chars")
-    context.user_data[USER_PENDING_DESCRIPTION] = desc
-    context.user_data[USER_AWAITING_DESCRIPTION] = False
-    context.user_data[USER_AWAITING_IMAGE] = True
-
-    keyboard = InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("Add Image", callback_data=f"addimage:{uid}"),
-            InlineKeyboardButton("Skip Image", callback_data=f"skipimage:{uid}"),
-        ]]
-    )
-    await update.message.reply_text(
-        f"Description received:\n\n{desc}\n\nWould you like to add an image as a banner?",
-        reply_markup=keyboard,
-    )
-
-
-async def image_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data_parts = query.data.split(":")
-    if len(data_parts) != 2:
-        return
-
-    action, uid_str = data_parts
-    uid = int(uid_str)
-    if query.from_user.id != uid:
-        await query.edit_message_text("Not your action.")
-        return
-
-    username = query.from_user.username or "no_username"
-    if action == "skipimage":
-        context.user_data[USER_PENDING_IMAGE] = None
-        context.user_data[USER_AWAITING_IMAGE] = False
-        desc = context.user_data.get(USER_PENDING_DESCRIPTION)
-        log_user_activity(uid, username, "IMAGE SKIPPED")
-        await show_final_confirmation(query, desc, None)
-        return
-
-    if action == "addimage":
-        context.user_data[USER_AWAITING_IMAGE] = True
-        log_user_activity(uid, username, "IMAGE REQUESTED")
-        await query.edit_message_text("Please send the image you want to use as a banner.")
-
-
-async def receive_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    username = update.effective_user.username or "no_username"
-    if not update.message.photo:
-        await update.message.reply_text("Please send a valid image.")
-        return
-
-    photo = update.message.photo[-1]
-    context.user_data[USER_PENDING_IMAGE] = photo.file_id
-    context.user_data[USER_AWAITING_IMAGE] = False
-    log_user_activity(uid, username, "IMAGE RECEIVED", f"File ID: {photo.file_id[:20]}...")
-
-    desc = context.user_data.get(USER_PENDING_DESCRIPTION)
-    if not desc:
-        clear_post_flow(context)
-        await update.message.reply_text("No description found. Please start again with /post.")
-        return
-    await show_final_confirmation(update.message, desc, photo.file_id)
-
-
-async def show_final_confirmation(message_obj, description: str, image_file_id: Optional[str]):
-    uid = message_obj.from_user.id
-    text_content = f"Description:\n\n{description}\n\n"
-    text_content += "Image included as banner\n\n" if image_file_id else "No image included\n\n"
-    text_content += "Please confirm to publish your post:"
-
-    keyboard = InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("Confirm", callback_data=f"confirmdesc:{uid}"),
-            InlineKeyboardButton("Edit Description", callback_data=f"editdesc:{uid}"),
-            InlineKeyboardButton("Cancel", callback_data=f"canceldesc:{uid}"),
-        ]]
-    )
-
-    if hasattr(message_obj, "edit_message_text"):
-        if image_file_id:
-            try:
-                await message_obj.edit_message_media(
-                    media=InputMediaPhoto(media=image_file_id, caption=text_content),
-                    reply_markup=keyboard,
-                )
-            except Exception:
-                logger.exception("Error editing message media; sending a new confirmation")
-                if message_obj.message:
-                    await message_obj.message.reply_photo(
-                        photo=image_file_id,
-                        caption=text_content,
-                        reply_markup=keyboard,
-                    )
-        else:
-            await message_obj.edit_message_text(text_content, reply_markup=keyboard)
-    else:
-        if image_file_id:
-            await message_obj.reply_photo(
-                photo=image_file_id,
-                caption=text_content,
-                reply_markup=keyboard,
-            )
-        else:
-            await message_obj.reply_text(text_content, reply_markup=keyboard)
-
-
-async def description_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data_parts = query.data.split(":")
-    if len(data_parts) != 2:
-        return
-
-    action, uid_str = data_parts
-    uid = int(uid_str)
-    if query.from_user.id != uid:
-        await query.edit_message_text("Not your action.")
-        return
-
-    username = query.from_user.username or "no_username"
-    if context.user_data.get(USER_CONFIRMING_POST):
-        return
-    context.user_data[USER_CONFIRMING_POST] = True
-
-    if action == "editdesc":
-        context.user_data[USER_AWAITING_DESCRIPTION] = True
-        context.user_data[USER_PENDING_IMAGE] = None
-        context.user_data[USER_AWAITING_IMAGE] = False
-        context.user_data.pop(USER_CONFIRMING_POST, None)
-        log_user_activity(uid, username, "EDIT DESCRIPTION REQUESTED")
-        if query.message and query.message.photo:
-            await query.edit_message_caption(caption="Send a new description.", reply_markup=None)
-        else:
-            await query.edit_message_text("Send a new description.", reply_markup=None)
-        return
-
-    if action == "canceldesc":
-        has_image = bool(query.message and query.message.photo)
-        clear_post_flow(context)
-        log_user_activity(uid, username, "POST CANCELLED AT CONFIRMATION")
-        await edit_result_message(query, "Post creation cancelled.", has_image)
-        return
-
-    if action != "confirmdesc":
-        context.user_data.pop(USER_CONFIRMING_POST, None)
-        return
-
-    desc = context.user_data.get(USER_PENDING_DESCRIPTION)
-    if not desc:
-        context.user_data.pop(USER_CONFIRMING_POST, None)
-        await edit_result_message(
-            query,
-            "No description found. Please start over with /post.",
-            bool(query.message and query.message.photo),
+    # copy_message keeps Telegram formatting/entities intact and keeps a photo
+    # together with its caption/description in one channel post.
+    try:
+        await context.bot.copy_message(
+            chat_id=MAIN_CHAT_ID,
+            from_chat_id=message.chat_id,
+            message_id=message.message_id,
         )
-        return
-
-    image_file_id = context.user_data.get(USER_PENDING_IMAGE)
-    has_image = image_file_id is not None
-
-    # Re-check the license and quota at the actual publishing moment.
-    lic = get_license(uid)
-    if not lic or utcnow() > datetime.fromisoformat(lic["expires_at"]):
-        clear_post_flow(context)
-        await edit_result_message(query, "Your license is no longer active.", has_image)
-        return
-    reset_daily_counts_if_needed(uid)
-    lic = get_license(uid)
-    if lic["posts_today"] >= lic["posts_per_day"]:
-        clear_post_flow(context)
-        await edit_result_message(query, "Daily post limit reached.", has_image)
-        return
-
-    try:
-        await query.edit_message_reply_markup(reply_markup=None)
-    except Exception:
-        logger.info("Could not remove confirmation keyboard before publishing")
-
-    footer = (
-        f"\n\nPosted by @{query.from_user.username}"
-        if query.from_user.username
-        else f"\n\nPosted by User {uid}"
-    )
-    full_description = desc + footer
-
-    try:
-        if image_file_id:
-            await context.bot.send_photo(
-                chat_id=MAIN_CHAT_ID,
-                photo=image_file_id,
-                caption=full_description,
-            )
-        else:
-            await context.bot.send_message(
-                chat_id=MAIN_CHAT_ID,
-                text=full_description,
-            )
     except Exception as exc:
-        logger.exception("Failed to send message to main chat")
-        log_user_activity(uid, username, "POST FAILED", str(exc))
-        clear_post_flow(context)
-        await edit_result_message(
-            query,
-            "Failed to publish your post. Please try again later.",
-            has_image,
-        )
+        logger.exception("Failed to copy direct message to main chat")
+        log_user_activity(uid, username, "DIRECT POST FAILED", str(exc))
+        await message.reply_text("Failed to publish your post. Please try again later.")
         return
+
+    description = message.caption or message.text or ""
+    has_image = bool(message.photo)
 
     increment_post_count(uid)
-    log_post_published(uid, username, full_description, has_image)
+    log_post_published(uid, username, description, has_image)
     if not is_admin(uid):
         set_cooldown(uid, utcnow() + timedelta(seconds=POST_COOLDOWN_SECONDS))
 
     clear_post_flow(context)
-    await edit_result_message(
-        query,
-        "Your post has been published to the main channel!",
-        has_image,
-    )
+    await message.reply_text("Your post has been published to the main channel!")
+
 
 # ------------------------------------------------------------
 # User Flow: /schedule
@@ -2155,21 +1973,54 @@ async def deleteschedule_command(update: Update, context: ContextTypes.DEFAULT_T
 # Message Routers
 # ------------------------------------------------------------
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # One text handler prevents the same update from being consumed by both
-    # the normal post flow and the schedule flow.
+    # Schedule prompts still take priority. Otherwise, any private DM text
+    # is treated as a direct post and copied to the main channel.
     if context.user_data.get(USER_AWAITING_SCHEDULE_TIME):
         await receive_schedule_time(update, context)
     elif context.user_data.get(USER_SCHEDULE_AWAITING_DESCRIPTION):
         await receive_schedule_description(update, context)
-    elif context.user_data.get(USER_AWAITING_DESCRIPTION):
-        await receive_description(update, context)
+    else:
+        await publish_direct_message(update, context)
 
 
 async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Schedule image prompts still take priority. Otherwise, any private DM
+    # photo with optional caption is copied to the main channel as one post.
     if context.user_data.get(USER_SCHEDULE_AWAITING_IMAGE):
         await receive_schedule_image(update, context)
-    elif context.user_data.get(USER_AWAITING_IMAGE):
-        await receive_image(update, context)
+    else:
+        await publish_direct_message(update, context)
+
+
+async def _shutdown_application(application):
+    # Give Telegram enough time to deliver the admin confirmation message,
+    # then stop polling cleanly. stop_running() is the preferred method for
+    # bots started with run_polling(); the fallback supports older PTB builds.
+    await asyncio.sleep(0.5)
+    try:
+        application.stop_running()
+        return
+    except AttributeError:
+        pass
+
+    updater = getattr(application, "updater", None)
+    if updater and getattr(updater, "running", False):
+        await updater.stop()
+    await application.stop()
+
+
+async def shutdown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    username = update.effective_user.username or "no_username"
+
+    if not is_admin(uid):
+        await update.message.reply_text("Not authorized.")
+        log_user_activity(uid, username, "UNAUTHORIZED SHUTDOWN ATTEMPT")
+        return
+
+    log_user_activity(uid, username, "SHUTDOWN REQUESTED", "Admin stopped the bot")
+    await update.message.reply_text("Shutdown command accepted. Bot is shutting down now.")
+    context.application.create_task(_shutdown_application(context.application))
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -2222,26 +2073,10 @@ def main():
     app.add_handler(CommandHandler("viewlogs", viewlogs))
     app.add_handler(CommandHandler("monitor", monitor))
     app.add_handler(CommandHandler("serverlogs", serverlogs))
+    app.add_handler(CommandHandler("shutdown", shutdown_command))
 
     # Monitoring callback
     app.add_handler(CallbackQueryHandler(refresh_monitor, pattern=r"^refresh_monitor$"))
-
-    # Normal post callbacks
-    app.add_handler(
-        CallbackQueryHandler(
-            post_start_confirm,
-            pattern=r"(?i)^(start_?post|cancel_?post|post_?yes|post_?no|yes_?post|no_?post|yes|no|cancel)(?::\d+)?$",
-        )
-    )
-    app.add_handler(
-        CallbackQueryHandler(image_choice, pattern=r"^(addimage|skipimage):")
-    )
-    app.add_handler(
-        CallbackQueryHandler(
-            description_actions,
-            pattern=r"^(confirmdesc|editdesc|canceldesc):",
-        )
-    )
 
     # Schedule callbacks
     app.add_handler(
