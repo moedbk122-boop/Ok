@@ -2014,6 +2014,61 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Unhandled exception while processing update", exc_info=context.error)
 
 
+
+
+# ------------------------------------------------------------
+# Status Page Heartbeat
+# ------------------------------------------------------------
+STATUS_PAGE_URL = os.getenv(
+    "STATUS_PAGE_URL",
+    "https://nextmpstatus.xyz",
+).rstrip("/")
+
+HEARTBEAT_SECRET = os.getenv("HEARTBEAT_SECRET", "").strip()
+
+
+def _send_heartbeat_request():
+    """Send one heartbeat using only Python's standard library."""
+    import urllib.request
+
+    request = urllib.request.Request(
+        f"{STATUS_PAGE_URL}/api/heartbeat",
+        data=b"{}",
+        headers={
+            "x-heartbeat-secret": HEARTBEAT_SECRET,
+            "Content-Type": "application/json",
+            "User-Agent": "next-mp-bot-heartbeat/1.0",
+        },
+        method="POST",
+    )
+
+    with urllib.request.urlopen(request, timeout=8) as response:
+        return response.status
+
+
+async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE):
+    if not HEARTBEAT_SECRET:
+        logger.warning(
+            "Heartbeat disabled: HEARTBEAT_SECRET is not set."
+        )
+        return
+
+    try:
+        status_code = await asyncio.to_thread(_send_heartbeat_request)
+
+        if 200 <= status_code < 300:
+            logger.info("Status heartbeat sent successfully.")
+        else:
+            logger.warning(
+                "Status heartbeat returned HTTP %s.",
+                status_code,
+            )
+
+    except Exception as exc:
+        # Heartbeat failure must never crash or stop the Telegram bot.
+        logger.warning("Status heartbeat failed: %s", exc)
+
+
 # ------------------------------------------------------------
 # Application Setup
 # ------------------------------------------------------------
@@ -2097,6 +2152,15 @@ def main():
         check_scheduled_posts,
         interval=SCHEDULE_CHECK_INTERVAL,
         first=10,
+    )
+    job_queue.run_repeating(
+        heartbeat_job,
+        interval=30,
+        first=1,
+    )
+    logger.info(
+        "Status page heartbeat started (interval: 30s, URL: %s)",
+        STATUS_PAGE_URL,
     )
     logger.info(
         "Scheduled posts checker started (interval: %ss)",
